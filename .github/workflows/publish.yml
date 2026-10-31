@@ -1,0 +1,124 @@
+name: Build, sign and publish package
+
+# Builds the ARMv7 package binary, runs the tests, wraps it in a signed Alpine
+# APK and publishes a signed package repository on GitHub Pages. Couch's
+# Integrations page installs from that repository once its public key
+# (keys/scsion-couch.rsa.pub) is trusted there.
+#
+# Needs: repository secret COUCH_SIGNING_KEY (the private PEM key), and
+# Settings -> Pages -> Source set to "GitHub Actions".
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+          targets: armv7-unknown-linux-musleabihf
+      - run: cargo fmt -- --check
+      - run: cargo test --locked --all-targets
+      - name: Check out Couch tooling at the pinned SDK revision
+        run: |
+          revision=$(python3 - <<'PY'
+          import pathlib, re
+          cargo = pathlib.Path("Cargo.toml").read_text(encoding="utf-8")
+          print(re.search(r'couch-sdk.*?rev = "([0-9a-f]{40})"', cargo).group(1))
+          PY
+          )
+          git init -q "$RUNNER_TEMP/couch"
+          git -C "$RUNNER_TEMP/couch" fetch -q --depth 1 https://github.com/Couch-OS/couch.git "$revision"
+          git -C "$RUNNER_TEMP/couch" checkout -q FETCH_HEAD
+      - name: Build the static ARMv7 binary
+        run: |
+          source=$PWD
+          cd "$RUNNER_TEMP/couch"
+          tools/fetch-zig.sh
+          . tools/arm-cc-env.sh
+          cd "$source"
+          cargo build --locked --release --target armv7-unknown-linux-musleabihf --bin couch-plugin-webos
+          file target/armv7-unknown-linux-musleabihf/release/couch-plugin-webos | grep -q 'statically linked'
+          mkdir -p out
+          cp target/armv7-unknown-linux-musleabihf/release/couch-plugin-webos out/
+          cp plugin.json out/
+          cp -r "$RUNNER_TEMP/couch/tools/integrations" out/tools
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary
+          path: out/
+
+  package:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container: alpine:3.20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: binary
+          path: out
+      - name: Install packaging tools
+        run: apk add --no-cache abuild apk-tools binutils jq openssl
+      - name: Build signed APK and repository
+        env:
+          COUCH_SIGNING_KEY: ${{ secrets.COUCH_SIGNING_KEY }}
+        run: |
+          set -eu
+          [ -n "$COUCH_SIGNING_KEY" ] || { echo "COUCH_SIGNING_KEY secret is missing" >&2; exit 1; }
+          keydir=$(mktemp -d)
+          umask 077
+          printf '%s\n' "$COUCH_SIGNING_KEY" > "$keydir/scsion-couch.rsa"
+          cp keys/scsion-couch.rsa.pub "$keydir/scsion-couch.rsa.pub"
+          # The secret and the committed public key must be one pair.
+          openssl rsa -in "$keydir/scsion-couch.rsa" -pubout 2>/dev/null \
+            | diff -q - keys/scsion-couch.rsa.pub >/dev/null \
+            || { echo "COUCH_SIGNING_KEY does not match keys/scsion-couch.rsa.pub" >&2; exit 1; }
+          umask 022
+          install -Dm644 keys/scsion-couch.rsa.pub /etc/apk/keys/scsion-couch.rsa.pub
+          chmod +x out/couch-plugin-webos out/tools/*.sh
+          version=$(jq -r .version out/plugin.json)
+          sh out/tools/build-apk.sh webos "$version" out/couch-plugin-webos out/plugin.json \
+            "$keydir/scsion-couch.rsa" apks
+          sh out/tools/build-repository.sh "$keydir/scsion-couch.rsa" apks site
+          cp keys/scsion-couch.rsa.pub site/
+          rm -rf "$keydir"
+          ls -l site/armv7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: site
+          path: site/
+
+  deploy:
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: site
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4
