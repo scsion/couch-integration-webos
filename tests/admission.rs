@@ -190,6 +190,11 @@ fn serve(
             continue;
         };
         log.lock().unwrap().push(uri.into());
+        if uri == "ssap://system.launcher/launch" {
+            if let Some(id) = request["payload"]["id"].as_str() {
+                log.lock().unwrap().push(format!("launch:{id}"));
+            }
+        }
         let payload = match uri {
             "ssap://audio/volumeUp" => json!({"returnValue": true}),
             "ssap://com.webos.service.networkinput/getPointerInputSocket" => json!({
@@ -290,6 +295,7 @@ fn pairs_then_controls_a_fake_tv_through_the_package_process() {
             "ssap://tv/getExternalInputList",
             "ssap://com.webos.applicationManager/listLaunchPoints",
             "ssap://system.launcher/launch",
+            "launch:netflix",
             "ssap://com.webos.service.apiadapter/audio/changeSoundOutput",
         ]
     );
@@ -298,6 +304,32 @@ fn pairs_then_controls_a_fake_tv_through_the_package_process() {
     // commit; full conformance/failure/timeout/spike fixtures are next.
     drop(testing::Package::new(adapter()));
     drop(session);
+}
+
+#[test]
+fn home_launches_the_configured_app_and_otherwise_presses_home() {
+    let tv = FakeTv::start(PairingScenario::Paired);
+    let package = Package::new(adapter());
+    let mut pairing = package.host();
+    pairing.pair_start(tv.settings(), None).unwrap();
+    let PairStep::Done { credential, .. } = pairing.pair_continue(None).unwrap() else {
+        panic!("pairing did not finish; requests={:?}", tv.requests());
+    };
+
+    let mut custom = tv.settings();
+    custom["home_app"] = json!("io.github.chiotas.lightkeeper");
+    let mut host = package.host();
+    host.configure_with(custom, Some(&credential)).unwrap();
+    host.command("home").unwrap();
+    tv.wait_for("launch:io.github.chiotas.lightkeeper");
+    assert!(!tv.requests().iter().any(|r| r == "pointer:HOME"));
+
+    let mut plain = package.host();
+    plain
+        .configure_with(tv.settings(), Some(&credential))
+        .unwrap();
+    plain.command("home").unwrap();
+    tv.wait_for("pointer:HOME");
 }
 
 #[test]

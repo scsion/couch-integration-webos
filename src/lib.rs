@@ -44,6 +44,20 @@ fn foreground_title(foreground: &Value) -> Option<String> {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Settings {
     pub url: String,
+    /// Optional webOS app ID that Couch's Home button launches instead of
+    /// pressing the TV's own Home key, for example a custom launcher such as
+    /// `io.github.chiotas.lightkeeper`. Empty or absent keeps the TV's Home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_app: Option<String>,
+}
+
+impl Settings {
+    fn home_app(&self) -> Option<&str> {
+        self.home_app
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+    }
 }
 
 impl ClientSettings for Settings {
@@ -53,6 +67,14 @@ impl ClientSettings for Settings {
         let (url, _, _) = endpoint(&self.url).map_err(|_| invalid_url())?;
         if url.path() != "/" || url.query().is_some() {
             return Err(invalid_url());
+        }
+        if let Some(id) = self.home_app() {
+            if !WebOsTv::supports_app(id) {
+                return Err(SdkError::Invalid.because(Reason::InvalidSetting {
+                    field: "home_app".into(),
+                    text: "Enter a webOS app ID, such as io.github.chiotas.lightkeeper".into(),
+                }));
+            }
         }
         Ok(())
     }
@@ -265,6 +287,7 @@ pub struct WebOsTv {
     socket: WebSocket<Socket>,
     pointer: Option<WebSocket<Socket>>,
     url: String,
+    home_app: Option<String>,
     pin: Arc<Mutex<Vec<u8>>>,
     next: u64,
 }
@@ -398,6 +421,7 @@ impl DeviceClient for WebOsTv {
             socket,
             pointer: None,
             url: settings.url.clone(),
+            home_app: settings.home_app().map(str::to_owned),
             pin,
             next: 0,
         })
@@ -450,7 +474,12 @@ impl DeviceClient for WebOsTv {
             Function::Right => self.button("RIGHT"),
             Function::Ok => self.button("ENTER"),
             Function::Back => self.button("BACK"),
-            Function::Home => self.button("HOME"),
+            Function::Home => match self.home_app.clone() {
+                Some(id) => self
+                    .request("ssap://system.launcher/launch", json!({"id": id}))
+                    .map(|_| ()),
+                None => self.button("HOME"),
+            },
             Function::Menu => self.button("MENU"),
             Function::Red => self.button("RED"),
             Function::Green => self.button("GREEN"),
@@ -687,7 +716,15 @@ mod tests {
             "ws://127.0.0.1:3000/",
             "wss://192.0.2.10:3001/",
         ] {
-            assert!(Settings { url: valid.into() }.validate().is_ok(), "{valid}");
+            assert!(
+                Settings {
+                    url: valid.into(),
+                    home_app: None
+                }
+                .validate()
+                .is_ok(),
+                "{valid}"
+            );
         }
         for invalid in [
             "",
@@ -701,7 +738,8 @@ mod tests {
         ] {
             assert!(
                 Settings {
-                    url: invalid.into()
+                    url: invalid.into(),
+                    home_app: None,
                 }
                 .validate()
                 .is_err(),
@@ -730,10 +768,34 @@ mod tests {
         assert_eq!(port, 3001);
 
         assert!(Settings {
-            url: url.to_string()
+            url: url.to_string(),
+            home_app: None,
         }
         .validate()
         .is_err());
+    }
+
+    #[test]
+    fn home_app_is_optional_trimmed_and_validated() {
+        let base = |home_app: Option<&str>| Settings {
+            url: "192.0.2.10".into(),
+            home_app: home_app.map(str::to_owned),
+        };
+        assert_eq!(base(None).home_app(), None);
+        assert_eq!(base(Some("   ")).home_app(), None);
+        assert_eq!(
+            base(Some(" io.github.chiotas.lightkeeper ")).home_app(),
+            Some("io.github.chiotas.lightkeeper")
+        );
+        assert!(base(Some("io.github.chiotas.lightkeeper"))
+            .validate()
+            .is_ok());
+        assert!(base(Some("bad\nid")).validate().is_err());
+        let old: Settings = serde_json::from_value(json!({"url": "192.0.2.10"})).unwrap();
+        assert_eq!(old.home_app, None);
+        let null: Settings =
+            serde_json::from_value(json!({"url": "192.0.2.10", "home_app": null})).unwrap();
+        assert_eq!(null.home_app, None);
     }
 
     #[test]

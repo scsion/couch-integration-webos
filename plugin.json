@@ -3,7 +3,7 @@
   "min_core_protocol_version": 5,
   "id": "webos",
   "label": "LG webOS TV",
-  "version": "0.1.0_pre5",
+  "version": "0.1.0_pre5_p1",
   "executable": "bin/couch-plugin-webos",
   "capabilities": [
     {"id": "power-off", "label": "Power off"},
@@ -40,6 +40,12 @@
       "label": "TV IP address",
       "kind": "text",
       "required": true
+    },
+    {
+      "id": "home_app",
+      "label": "Home button opens app (webOS app ID, optional)",
+      "kind": "text",
+      "required": false
     }
   ],
   "supports_inputs": true,
