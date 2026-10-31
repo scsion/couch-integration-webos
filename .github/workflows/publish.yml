@@ -64,40 +64,50 @@ jobs:
   package:
     needs: build
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    container: alpine:3.20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
       - uses: actions/download-artifact@v4
         with:
           name: binary
           path: out
-      - name: Install packaging tools
-        run: apk add --no-cache abuild apk-tools binutils jq openssl
-      - name: Build signed APK and repository
+      # abuild only packages for the architecture it runs on, so package
+      # inside an ARMv7 Alpine container under QEMU, as Couch's own
+      # tools/integrations/smoke.sh does.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm
+      - name: Build signed APK and repository (ARMv7 Alpine)
         env:
           COUCH_SIGNING_KEY: ${{ secrets.COUCH_SIGNING_KEY }}
         run: |
           set -eu
           [ -n "$COUCH_SIGNING_KEY" ] || { echo "COUCH_SIGNING_KEY secret is missing" >&2; exit 1; }
-          keydir=$(mktemp -d)
-          umask 077
-          printf '%s\n' "$COUCH_SIGNING_KEY" > "$keydir/scsion-couch.rsa"
-          cp keys/scsion-couch.rsa.pub "$keydir/scsion-couch.rsa.pub"
-          # The secret and the committed public key must be one pair.
-          openssl rsa -in "$keydir/scsion-couch.rsa" -pubout 2>/dev/null \
-            | diff -q - keys/scsion-couch.rsa.pub >/dev/null \
-            || { echo "COUCH_SIGNING_KEY does not match keys/scsion-couch.rsa.pub" >&2; exit 1; }
-          umask 022
-          install -Dm644 keys/scsion-couch.rsa.pub /etc/apk/keys/scsion-couch.rsa.pub
-          chmod +x out/couch-plugin-webos out/tools/*.sh
-          version=$(jq -r .version out/plugin.json)
-          sh out/tools/build-apk.sh webos "$version" out/couch-plugin-webos out/plugin.json \
-            "$keydir/scsion-couch.rsa" apks
-          sh out/tools/build-repository.sh "$keydir/scsion-couch.rsa" apks site
-          cp keys/scsion-couch.rsa.pub site/
-          rm -rf "$keydir"
-          ls -l site/armv7
+          owner="$(id -u):$(id -g)"
+          docker run --rm --platform linux/arm/v7 \
+            -e COUCH_SIGNING_KEY -e OWNER="$owner" \
+            -v "$PWD:/work" -w /work alpine:3.21 sh -ec '
+              uname -m
+              apk add --no-cache abuild apk-tools binutils jq openssl >/dev/null
+              keydir=$(mktemp -d)
+              (umask 077; printf "%s\n" "$COUCH_SIGNING_KEY" | tr -d "\r" > "$keydir/scsion-couch.rsa")
+              tr -d "\r" < keys/scsion-couch.rsa.pub > "$keydir/scsion-couch.rsa.pub"
+              # The secret and the committed public key must be one pair.
+              openssl rsa -in "$keydir/scsion-couch.rsa" -pubout 2>/dev/null \
+                | diff -q - "$keydir/scsion-couch.rsa.pub" >/dev/null \
+                || { echo "COUCH_SIGNING_KEY does not match keys/scsion-couch.rsa.pub" >&2; exit 1; }
+              install -Dm644 "$keydir/scsion-couch.rsa.pub" /etc/apk/keys/scsion-couch.rsa.pub
+              chmod +x out/couch-plugin-webos out/tools/*.sh
+              version=$(jq -er .version out/plugin.json)
+              package=$(sh out/tools/build-apk.sh webos "$version" out/couch-plugin-webos \
+                out/plugin.json "$keydir/scsion-couch.rsa" apks)
+              apk --keys-dir "$keydir" verify "$package"
+              sh out/tools/build-repository.sh "$keydir/scsion-couch.rsa" apks site
+              cp "$keydir/scsion-couch.rsa.pub" site/
+              rm -rf "$keydir"
+              chown -R "$OWNER" apks site
+              ls -l site/armv7
+            '
       - uses: actions/upload-artifact@v4
         with:
           name: site
