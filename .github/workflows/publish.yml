@@ -88,7 +88,10 @@ jobs:
             -e COUCH_SIGNING_KEY -e OWNER="$owner" \
             -v "$PWD:/work" -w /work alpine:3.21 sh -ec '
               uname -m
-              apk add --no-cache abuild apk-tools binutils jq openssl >/dev/null
+              # abuild always pulls in build-base; install the same SDK bundle as
+              # the Couch smoke.sh script, with a package index for abuild.
+              apk update >/dev/null
+              apk add alpine-sdk binutils jq openssl >/dev/null
               keydir=$(mktemp -d)
               (umask 077; printf "%s\n" "$COUCH_SIGNING_KEY" | tr -d "\r" > "$keydir/scsion-couch.rsa")
               tr -d "\r" < keys/scsion-couch.rsa.pub > "$keydir/scsion-couch.rsa.pub"
